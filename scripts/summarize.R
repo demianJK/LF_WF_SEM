@@ -1,29 +1,42 @@
-### summarize results of simulation study
+### summarize results of Monte Carlo study
 
 # (install and) load packages
 packages <- c("lavaan", 
               "tidyr", 
               "dplyr",
-              "xlsx"
+              "xlsx",
+              "DescTools"
 )
-newPackages <-
-  packages[!(packages %in% installed.packages()[, "Package"])]
+newPackages <- packages[!(packages %in% installed.packages()[, "Package"])]
 if (length(newPackages)){install.packages(newPackages)}
 lapply(packages, require, character.only = TRUE)
 
 # set paths and load data
+# setwd("C:/Users/Julia/Documents/projects/MSEMcovreg_deprecated")
 pathO <- "objects/"
 pathF <- "data/fit/"
 pathD <- "data/raw/"
-source("scripts/functions/projectInfo.R") # infos simulation study
+source("scripts/functions/projectInfo.R") # infos about MC study
 pI <- projectInfo()
-source("scripts/functions/covMulti.R") # to estimate within- and between-cluster covariance matrices
+source("scripts/functions/covMulti.R") # to compute within- and between-cluster covariance matrix in LF
 
 TableConds <- readRDS(paste0(pathO, "SimConds.rds"))
 ncond <- nrow(TableConds)
 nrep <- pI$nrep
 approaches <- pI$approaches
 napproach <- length(approaches)
+
+# if correlations are fixed, they are set here
+cB <- TRUE
+cW <- TRUE
+if (!"cor_B" %in% colnames(TableConds)){
+  cor_B <- 0.3
+  cB <- FALSE
+}
+if (!"cor_W" %in% colnames(TableConds)){
+  cor_W <- 0.3
+  cW <- FALSE
+}
 
 # Do you want to center the data in LF and WF?
 center <- FALSE
@@ -32,29 +45,43 @@ center <- FALSE
 # put all relevant info from single rds files lavaan objects into one list
 
 critsList <- c("Sigma_W_ns", # within-cluster sample covariance matrix
+               "Sigma_W_allZero",
                "Sigma_W_def", # 
                "Sigma_W_kappa",
                "Sigma_B_ns", # between-cluster sample covariance matrix
+               "Sigma_B_allZero",
                "Sigma_B_def",
                "Sigma_B_kappa",
-               # note that for WF, there is only one covariance matrix, whose stats are saved in the between-cluster slots here
+               # note that for WF, there is only one covariance matrix S_T, whose stats are saved in the Sigma_B slots
                "conv", # Did the model converge?
                "time", # How long did it take till the model converged?
                "W", # within-cluster model parameters
-               "B" # between-cluster model parameters
+               "B", # between-cluster model parameters
+               "coverage_W", # TRUE/FALSE whether confidence interval encompasses population parameter
+               "coverage_B",
+               "ICC_S", # only for LF (based on lavaans (!) S_pw and S_b)
+               "ICC_Sigma" # only for LF (based on Sigma_W and Sigma_B)
                ) 
 
 # create list to save results of each replication
-ListStats <- setNames(as.list(approaches), approaches)
+ListStats <- setNames(as.list(approaches), approaches) 
 ListStats <- lapply(ListStats, function(x){
   setNames(vector("list", length(critsList)), critsList)
 })
-for (i in 1:napproach){ # inititalizing necessary
+for (i in 1:napproach){ # initializing necessary
   for (j in 1:length(critsList)){
     ListStats[[i]][[j]] <- setNames(vector("list", ncond), 1:ncond)
     for (k in 1:ncond){
       ListStats[[i]][[j]][[k]] <- setNames(vector("list", nrep), 1:nrep)
     }
+  }
+}
+
+errorMessages <- setNames(as.list(approaches), approaches)
+for (i in 1:napproach){ # initializing necessary
+  errorMessages[[i]]<- setNames(vector("list", ncond), 1:ncond)
+  for (k in 1:ncond){
+    errorMessages[[i]][[k]] <- setNames(vector("list", nrep), 1:nrep)
   }
 }
 
@@ -65,11 +92,21 @@ for (rep in 1:nrep){
     g <- TableConds$g[cond]
     popVar_B <- TableConds$ICC[cond]
     popVar_W <- (1 - TableConds$ICC[cond])
-    popCor_B <- 0.3 * popVar_B
-    popCor_W <- 0.3 * popVar_W
+    if (cB){
+      popCov_B <- TableConds$cor_B[cond] * popVar_B
+    } else{
+      popCov_B <- cor_B * popVar_B
+    }
+    if (cW){
+      popCov_W <- TableConds$cor_W[cond] * popVar_W
+    } else{
+      popCov_W <- cor_W * popVar_W
+    }
     # relevant for indexing parameters
     pc <- p * (p + 1) / 2 # number of unique covariance matrix elements (in LF)
     c <- pc-p # numb of unique covariances
+    popParams_W <- c(rep(popVar_W, p), rep(popCov_W, c))
+    popParams_B <- c(rep(popVar_B, p), rep(popCov_B, c))
     fitList <- readRDS(paste0(pathF, "fit_C", cond, "_R", rep, ".rds"))
     data <- readRDS(paste0(pathD, "data_C", cond, "_R", rep, ".rds"))
     
@@ -85,31 +122,34 @@ for (rep in 1:nrep){
     }
       
     
-    for (i in 1:napproach){
+    for (i in 1:napproach){ 
       fit <- fitList[[(paste0("fit_", approaches[i]))]]
       
-      # matrix properties
+      ### matrix properties
       # tolerance for zero (1e-08) and definiteness checks taken from matrixcalc functions
+      
       if ("LF" %in% approaches[i]){
         covs <- covMulti(data_LF[,3:(3+p-1)], data_LF[,1])
-        
-        # covs$S_pw = fit@SampleStats@YLp[[1]][[2]][["Sigma.W"]]
+        #lavInspect(fit, "h1")
+
+        # covs$S_pw == fit@SampleStats@YLp[[1]][[2]][["Sigma.W"]]
         eigen_W <- eigen(covs$S_pw)$values
         for (m in 1:p){
           if (abs(eigen_W[m]) < 1e-08){
             eigen_W[m] <- 0
           }
         }
-        ListStats[[approaches[i]]][["Sigma_W_ns"]][[cond]][[rep]] <- !any(eigen_W == 0) 
-        if ( !any(eigen_W <= 0) ) { def <- "pd" 
+        ListStats[[approaches[i]]][["Sigma_W_ns"]][[cond]][[rep]] <- !any(eigen_W == 0)
+        ListStats[[approaches[i]]][["Sigma_W_allZero"]][[cond]][[rep]] <- all(eigen_W == 0)
+        if ( !any(eigen_W <= 0) ) { def <- "pd"
         } else if ( !any(eigen_W <  0) ) { def <- "psd" # matrix with all zero eigenvalues is psd
         } else if ( !any(eigen_W >= 0) ) { def <- "nd"
-        } else if ( !any(eigen_W >  0) ) { def <- "nsd" 
+        } else if ( !any(eigen_W >  0) ) { def <- "nsd"
         } else if ( (any(eigen_W >  0) && any(eigen_W < 0)) ) { def <- "id" }
         ListStats[[approaches[i]]][["Sigma_W_def"]][[cond]][[rep]] <- def
         ListStats[[approaches[i]]][["Sigma_W_kappa"]][[cond]][[rep]] <- max(abs(eigen_W))/min(abs(eigen_W))
-        
-        
+
+
         Sigma_B <- covs$Sigma_B
         # in lavaan, negative variances, and related covariances are set to zero; we emulate that
         for (k in 1:p){
@@ -118,82 +158,132 @@ for (rep in 1:nrep){
             Sigma_B[k,] <- 0
           }
         }
-        # Sigma_B = fit@SampleStats@YLp[[1]][[2]][["Sigma.B"]]
+        # Sigma_B == fit@SampleStats@YLp[[1]][[2]][["Sigma.B"]]
         eigen_B <- eigen(Sigma_B)$values
         for (m in 1:p){
           if (abs(eigen_B[m]) < 1e-08){
             eigen_B[m] <- 0
           }
         }
-        ListStats[[approaches[i]]][["Sigma_B_ns"]][[cond]][[rep]] <- !any(eigen_B == 0) 
-        if ( !any(eigen_B <= 0) ) { def <- "pd" 
-        } else if ( !any(eigen_B <  0) ) { def <- "psd" 
+        ListStats[[approaches[i]]][["Sigma_B_ns"]][[cond]][[rep]] <- !any(eigen_B == 0)
+        ListStats[[approaches[i]]][["Sigma_B_allZero"]][[cond]][[rep]] <- all(eigen_B == 0)
+        if ( !any(eigen_B <= 0) ) { def <- "pd"
+        } else if ( !any(eigen_B <  0) ) { def <- "psd"
         } else if ( !any(eigen_B >= 0) ) { def <- "nd"
-        } else if ( !any(eigen_B >  0) ) { def <- "nsd" 
+        } else if ( !any(eigen_B >  0) ) { def <- "nsd"
         } else if ( (any(eigen_B >  0) && any(eigen_B < 0)) ) { def <- "id" }
         ListStats[[approaches[i]]][["Sigma_B_def"]][[cond]][[rep]] <- def
         ListStats[[approaches[i]]][["Sigma_B_kappa"]][[cond]][[rep]] <- max(abs(eigen_B))/min(abs(eigen_B))
-        
-        
-        
-      } else { # in WF, fill information of Sigma_WF_T in Sigma_B slots
-        
+
+      } else { # WF biased
+
         Sigma_T <- round(cov(data_WF[,2:(p*n+1)]) * (g-1)/g, 3) # here the covariance matrix is rounded in lavaan
-        # Sigma_T = lavInspect(fit, "sampstat")$cov
+        # Sigma_T == lavInspect(fit, "sampstat")$cov
         eigen_T <- eigen(Sigma_T)$values
         for (m in 1:p){
           if (abs(eigen_T[m]) < 1e-08){
             eigen_T[m] <- 0
           }
         }
-        ListStats[[approaches[i]]][["Sigma_B_ns"]][[cond]][[rep]] <- !any(eigen_T == 0) 
-        if ( !any(eigen_T <= 0) ) { def <- "pd" 
+        ListStats[[approaches[i]]][["Sigma_B_ns"]][[cond]][[rep]] <- !any(eigen_T == 0)
+        ListStats[[approaches[i]]][["Sigma_B_allZero"]][[cond]][[rep]] <- all(eigen_T == 0)
+        if ( !any(eigen_T <= 0) ) { def <- "pd"
         } else if ( !any(eigen_T <  0) ) { def <- "psd"
         } else if ( !any(eigen_T >= 0) ) { def <- "nd"
-        } else if ( !any(eigen_T >  0) ) { def <- "nsd" 
+        } else if ( !any(eigen_T >  0) ) { def <- "nsd"
         } else if ( (any(eigen_T >  0) && any(eigen_T < 0)) ) { def <- "id" }
         ListStats[[approaches[i]]][["Sigma_B_def"]][[cond]][[rep]] <- def
         ListStats[[approaches[i]]][["Sigma_B_kappa"]][[cond]][[rep]] <- max(abs(eigen_T))/min(abs(eigen_T))
 
       }
 
-      # model properties
-      ListStats[[approaches[i]]][["conv"]][[cond]][[rep]] <- FALSE 
+      ### model properties
+      
+      ListStats[[approaches[i]]][["conv"]][[cond]][[rep]] <- FALSE
       ListStats[[approaches[i]]][["time"]][[cond]][[rep]] <- NA
       ListStats[[approaches[i]]][["W"]][[cond]][[rep]] <- NA
       ListStats[[approaches[i]]][["B"]][[cond]][[rep]] <- NA
       
-      if(!is.atomic(fit) && fit@Fit@converged){ # if no error occured and model converged
+      if(!is.atomic(fit) && fit@Fit@converged){ # if exists and optimizer says converged
         ListStats[[approaches[i]]][["conv"]][[cond]][[rep]] <- fit@Fit@converged
-        ListStats[[approaches[i]]][["time"]][[cond]][[rep]] <- unname(fit@timing[["total"]])
+        ListStats[[approaches[i]]][["time"]][[cond]][[rep]] <- unname(fit@timing[["total"]]) # in s
+        if ("WFcovreg" %in% approaches[i]){
+          ListStats[[approaches[i]]][["time"]][[cond]][[rep]] <- round(unname(fit@timing[["total"]]) + fitList$WFcovreg$covreg_time, 2) # in s
+        }
         if ("LF" %in% approaches[i]){
+          
+          ## parameter estimates
           ListStats[[approaches[i]]][["W"]][[cond]][[rep]] <- fit@Fit@x[1:pc]
-          ListStats[[approaches[i]]][["B"]][[cond]][[rep]] <- fit@Fit@x[(pc + 1):(2 * pc)]
-        } else if (grepl("WF", approaches[i])){
+          ListStats[[approaches[i]]][["B"]][[cond]][[rep]] <- fit@Fit@x[(pc + 1):(2 * pc)] # the following elements would be the between level intercepts
+          
+          ## coverage
+          logParams_W <- c(rep(TRUE, pc), # within variances and covariances
+                           rep(FALSE, p), # within means and (between) factor leadings
+                           rep(FALSE, pc), # between variances and covariances
+                           rep(FALSE, p)) # between means
+          ListStats[[approaches[i]]][["coverage_W"]][[cond]][[rep]] <- popParams_W %()% as.matrix(parameterEstimates(fit)[logParams_W,c("ci.lower", "ci.upper")])
+          logParams_B <- c(rep(FALSE, pc), # within variances and covariances
+                           rep(FALSE, p), # within means and (between) factor leadings
+                           rep(TRUE, pc), # between variances and covariances
+                           rep(FALSE, p)) # between means
+          ListStats[[approaches[i]]][["coverage_B"]][[cond]][[rep]] <- popParams_B %()% as.matrix(parameterEstimates(fit)[logParams_B, c("ci.lower", "ci.upper")])
+          
+          # ICC_S 
+          # == lavInspect(fit, "h1")$groups$cov /  (lavInspect(fit, "h1")$groups$cov + lavInspect(fit, "h1")$within$cov)
+          ListStats[[approaches[i]]][["ICC_S"]][[cond]][[rep]] <- #round(mean(
+            lavInspect(fit, "icc")#), 2)
+          
+          # ICC_Sigma
+          # == round(diag(covMulti(data_T[,1:p], data_T[,p+1])$Sigma_B / (covMulti(data_T[,1:p], data_T[,p+1])$Sigma_B + covMulti(data_T[,1:p], data_T[,p+1])$S_pw)), 3)
+          ListStats[[approaches[i]]][["ICC_Sigma"]][[cond]][[rep]] <- #round(mean(
+            diag(fit@SampleStats@YLp[[1]][[2]][["Sigma.B"]] / (fit@SampleStats@YLp[[1]][[2]][["Sigma.B"]] + fit@SampleStats@YLp[[1]][[2]][["Sigma.W"]]))#), 3)
+          
+        } else {
+          
+          ## parameter estimates
           # within: n*p times
           idxW_var <- c() # all equals (n) consecutively
           for (j in 1:p){
             idxW_var <- append(idxW_var, (j-1)*n+1)
           }
-          startW_cov <- p*n
-          idxW_cov <- (startW_cov+1):(startW_cov+c) # all uniques, then equal (n) again
+          endVarW <- p*n
+          idxW_cov <- (endVarW+1):(endVarW+c) # all uniques, then equal (n) again
           idxW_all <- c(idxW_var, idxW_cov) 
           # between: p times
-          startB_var <- tail(idxW_all,1)+c+1 
+          startB_var <- tail(idxW_all,1)+1+c*(n-1) 
           idxB_var <- startB_var:(startB_var+(p-1))
           startB_cov <- tail(idxB_var,1)+1
-          covB <- startB_cov:(startB_cov+(c-1))
-          idxB_all <- c(idxB_var, covB)
+          idxB_cov <- startB_cov:(startB_cov+(c-1))
+          idxB_all <- c(idxB_var, idxB_cov)
+          # the following elements would be the between level (factor) intercepts (means)
+          
           ListStats[[approaches[i]]][["W"]][[cond]][[rep]] <- fit@Fit@x[idxW_all]  
-          ListStats[[approaches[i]]][["B"]][[cond]][[rep]] <- fit@Fit@x[idxB_all]
-
+          ListStats[[approaches[i]]][["B"]][[cond]][[rep]] <- fit@Fit@x[idxB_all] 
+          
+          ## coverage
+          wvc <- rep(FALSE, p*n+c*n)
+          wvc[c(seq(1, p*n, n), # variances (duplicate e.g 111222)
+                seq(p*n+1, p*n+c, 1)) # covariances (in row e.g. 121212)
+              ] <- TRUE # select only first of duplicate elements (because of equality constraints)
+          logParams_W <- c(wvc, # within variances and covariances
+                         rep(FALSE, p*n+p*n), # within means and (between) factor leadings
+                         rep(FALSE, pc), # between variances and covariances
+                         rep(FALSE, p)) # between means
+          ListStats[[approaches[i]]][["coverage_W"]][[cond]][[rep]] <- popParams_W %()% as.matrix(parameterEstimates(fit)[logParams_W,c("ci.lower", "ci.upper")])
+          
+          logParams_B <- c(rep(FALSE, p*n+c*n), # within variances and covariances
+                           rep(FALSE, p*n+p*n), # within means and (between) factor leadings
+                           rep(TRUE, pc), # between variances and covariances
+                           rep(FALSE, p)) # between means
+          ListStats[[approaches[i]]][["coverage_B"]][[cond]][[rep]] <- popParams_B %()% as.matrix(parameterEstimates(fit)[logParams_B, c("ci.lower", "ci.upper")])
         }
+      } else if (!is.null(attr(fit, "condition"))) { # save error note (mainly not positive definite S in WF?)
+        errorMessages[[approaches[i]]][[cond]][[rep]] <- attr(fit, "condition")[[1]] # only error, not function call
       }
     }
-    
     gc()
-    
   }
+  print(rep)
 }
 
 saveRDS(ListStats, file = paste0(pathO, "ListStats.rds"))
@@ -203,7 +293,7 @@ saveRDS(ListStats, file = paste0(pathO, "ListStats.rds"))
 ### ListStats --> TableStats  ######################################################################################################################################################
 # summarize info from list into table
 
-matrx <- c("ns", "pd", "psd", "nd", "nsd", "id", "kappa", "Infkappa")
+matrx <- c("ns", "allZero", "pd", "psd", "nd", "nsd", "id", "kappa", "Infkappa")
 estim <- c("MAE", "MSE", "RMSE", "Bias", "Var")
 critsTable <- c(paste(matrx,  "W", sep="_"),
                 paste(matrx,  "B", sep="_"),
@@ -233,8 +323,21 @@ critsTable <- c(paste(matrx,  "W", sep="_"),
                 # overall
                 paste(estim, "B", sep="_"),
                 paste(paste0("rel", estim), "B", sep="_"),
+                
                 # negative variances
-                "negVar_B"
+                "negVar_B",
+                
+                # coverage
+                "coverage_W",
+                "coverage_B",
+                
+                # Intraclass Correlation
+                "ICC_S",
+                "ICC_S_neg", # percentage of negative ICCs (which are set to zero for the mean ICC)
+                "ICC_Sigma",
+                "ICC_Sigma_neg",
+                "ICC_Sigma_theta",
+                "ICC_Sigma_theta_neg"
                 )
 
 colTable <- c()
@@ -249,7 +352,7 @@ TableStats <- dplyr::mutate(TableStats, df_WF= ((p*n)*(p*n+1)/2 + (p*n))  - ((p)
 TableStats <- cbind(TableStats, tmp)
 
 # note that the relative parameters (e.g., relRMSE) are not computed in the order according to the formula, 
-# but the order is changed on mathemical basis to allow for more efficient code
+# but the order is changed on mathematical basis to allow for more efficient code
 
 for (cond in 1:ncond){
   
@@ -258,15 +361,24 @@ for (cond in 1:ncond){
   n <- TableConds$n[cond]
   popVar_B <- TableConds$ICC[cond]
   popVar_W <- (1 - TableConds$ICC[cond])
-  popCov_B <- 0.3 * popVar_B 
-  popCov_W <- 0.3 * popVar_W
+  popVar_B <- TableConds$ICC[cond]
+  popVar_W <- (1 - TableConds$ICC[cond])
+  if (cB){
+    popCov_B <- TableConds$cor_B[cond] * popVar_B
+  } else{
+    popCov_B <- cor_B * popVar_B
+  }
+  if (cW){
+    popCov_W <- TableConds$cor_W[cond] * popVar_W
+  } else{
+    popCov_W <- cor_W * popVar_W
+  }
   pc <- p * (p + 1) / 2
   c <- pc - p
   # sorting of params in LF and WF: varW (p), covW (c), varB (p), covB (c)
   
   for (i in 1:napproach){
-    
-    
+
     # matrix properties
     if ("LF" %in% approaches[i]){
       
@@ -275,13 +387,18 @@ for (cond in 1:ncond){
       tmp <- table(tmpList)
       TableStats[cond, paste("ns_W", approaches[i], sep="_")] <- tmp[1] / ( tmp[1] + tmp[2]) * 100
       
+      tmpList <- unname(unlist(ListStats[[approaches[i]]][["Sigma_W_allZero"]][[cond]]))
+      tmpList <- factor(tmpList, levels=c("TRUE", "FALSE"))
+      tmp <- table(tmpList)
+      TableStats[cond, paste("allZero_W", approaches[i], sep="_")] <- tmp[1] / ( tmp[1] + tmp[2]) * 100
+      
       tmpList <- unname(unlist(ListStats[[approaches[i]]][["Sigma_W_def"]][[cond]]))
       tmpList <- factor(tmpList, levels=c("pd", "psd", "nd", "nsd", "id"))
       tmp <- table(tmpList)
       TableStats[cond, paste("pd_W", approaches[i], sep="_")] <- tmp[1] / length(tmpList) * 100
-      TableStats[cond, paste("psd_W", approaches[i], sep="_")] <- tmp[2] / length(tmpList) * 100
+      TableStats[cond, paste("psd_W", approaches[i], sep="_")] <- (tmp[1] + tmp[2]) / length(tmpList) * 100
       TableStats[cond, paste("nd_W", approaches[i], sep="_")] <- tmp[3] / length(tmpList) * 100
-      TableStats[cond, paste("nsd_W", approaches[i], sep="_")] <- tmp[4] / length(tmpList) * 100
+      TableStats[cond, paste("nsd_W", approaches[i], sep="_")] <- (tmp[3] + tmp[4]) / length(tmpList) * 100
       TableStats[cond, paste("id_W", approaches[i], sep="_")] <- tmp[5] / length(tmpList) * 100
       
       tmpList <- unname(unlist(ListStats[[approaches[i]]][["Sigma_W_kappa"]][[cond]]))
@@ -294,58 +411,58 @@ for (cond in 1:ncond){
       tmp <- table(tmpInf)
       TableStats[cond, paste("Infkappa_W", approaches[i], sep="_")] <- tmp[1] / ( tmp[1] + tmp[2]) * 100
       
+      # ICC_S
+      ICC_S <- unname(unlist(ListStats[[approaches[i]]][["ICC_S"]][[cond]]))
+      tmp <- sum(ICC_S < 0)
+      if (tmp > 0){
+        TableStats[cond, paste("ICC_S_neg", approaches[i], sep="_")] <- round(tmp/length(ICC_S) * 100, 2)
+        ICC_S[ICC_S < 0] <- 0
+      }
+      TableStats[cond, paste("ICC_S", approaches[i], sep="_")] <- round(mean(ICC_S, na.rm=TRUE), 2)
+      
+      # ICC_Sigma
+      ICC_Sigma <- unname(unlist(ListStats[[approaches[i]]][["ICC_Sigma"]][[cond]]))
+      tmp <- sum(ICC_Sigma < 0)
+      if (tmp > 0){
+        TableStats[cond, paste("ICC_Sigma_neg", approaches[i], sep="_")] <- round(tmp/length(ICC_Sigma) * 100, 2)
+        ICC_Sigma[ICC_Sigma < 0] <- 0
+      }
+      TableStats[cond, paste("ICC_Sigma", approaches[i], sep="_")] <- round(mean(ICC_Sigma, na.rm=TRUE), 2)
+    
+    } 
       
       tmpList <- unname(unlist(ListStats[[approaches[i]]][["Sigma_B_ns"]][[cond]]))
       tmpList <- factor(tmpList, levels=c("TRUE", "FALSE"))
       tmp <- table(tmpList)
       TableStats[cond, paste("ns_B", approaches[i], sep="_")] <- tmp[1] / ( tmp[1] + tmp[2]) * 100
       
-      tmpList <- unname(unlist(ListStats[[approaches[i]]][["Sigma_B_def"]][[cond]]))
-      tmpList <- factor(tmpList, levels=c("pd", "psd", "nd", "nsd", "id"))
-      tmp <- table(tmpList)
-      TableStats[cond, paste("pd_B", approaches[i], sep="_")] <- tmp[1] / length(tmpList) * 100
-      TableStats[cond, paste("psd_B", approaches[i], sep="_")] <- tmp[2] / length(tmpList) * 100
-      TableStats[cond, paste("nd_B", approaches[i], sep="_")] <- tmp[3] / length(tmpList) * 100
-      TableStats[cond, paste("nsd_B", approaches[i], sep="_")] <- tmp[4] / length(tmpList) * 100
-      TableStats[cond, paste("id_B", approaches[i], sep="_")] <- tmp[5] / length(tmpList) * 100
-      
-      tmpList <- unname(unlist(ListStats[[approaches[i]]][["Sigma_B_kappa"]][[cond]]))
-      tmpInf <- is.infinite(tmpList)
-      if (any(tmpInf)){
-        tmpList[tmpInf] <- NA
-      }
-      TableStats[cond, paste("kappa_B", approaches[i], sep="_")] <- round(mean(tmpList, na.rm=TRUE), 3)
-      tmpInf <- factor(tmpInf, levels=c("TRUE", "FALSE"))
-      tmp <- table(tmpInf)
-      TableStats[cond, paste("Infkappa_B", approaches[i], sep="_")] <- tmp[1] / ( tmp[1] + tmp[2]) * 100
-      
-    } else { # in WF, fill information of Sigma_WF_T in Sigma_B slots
-      
-      tmpList <- unname(unlist(ListStats[[approaches[i]]][["Sigma_B_ns"]][[cond]]))
+      tmpList <- unname(unlist(ListStats[[approaches[i]]][["Sigma_B_allZero"]][[cond]]))
       tmpList <- factor(tmpList, levels=c("TRUE", "FALSE"))
       tmp <- table(tmpList)
-      TableStats[cond, paste("ns_B", approaches[i], sep="_")] <- tmp[1] / ( tmp[1] + tmp[2]) * 100
+      TableStats[cond, paste("allZero_B", approaches[i], sep="_")] <- tmp[1] / ( tmp[1] + tmp[2]) * 100
       
       tmpList <- unname(unlist(ListStats[[approaches[i]]][["Sigma_B_def"]][[cond]]))
       tmpList <- factor(tmpList, levels=c("pd", "psd", "nd", "nsd", "id"))
       tmp <- table(tmpList)
-      TableStats[cond, paste("pd_B", approaches[i], sep="_")] <- tmp[1] / length(tmpList) * 100
-      TableStats[cond, paste("psd_B", approaches[i], sep="_")] <- tmp[2] / length(tmpList) * 100
-      TableStats[cond, paste("nd_B", approaches[i], sep="_")] <- tmp[3] / length(tmpList) * 100
-      TableStats[cond, paste("nsd_B", approaches[i], sep="_")] <- tmp[4] / length(tmpList) * 100
-      TableStats[cond, paste("id_B", approaches[i], sep="_")] <- tmp[5] / length(tmpList) * 100
+      TableStats[cond, paste("pd_B", approaches[i], sep = "_")] <- tmp[1] / length(tmpList) * 100
+      TableStats[cond, paste("psd_B", approaches[i], sep = "_")] <- (tmp[1] + tmp[2]) / length(tmpList) * 100
+      TableStats[cond, paste("nd_B", approaches[i], sep = "_")] <- tmp[3] / length(tmpList) * 100
+      TableStats[cond, paste("nsd_B", approaches[i], sep = "_")] <- (tmp[3] + tmp[4]) / length(tmpList) * 100
+      TableStats[cond, paste("id_B", approaches[i], sep = "_")] <- tmp[5] / length(tmpList) * 100
       
-      tmpList <- unname(unlist(ListStats[[approaches[i]]][["Sigma_B_kappa"]][[cond]]))
+      tmpList <-
+        unname(unlist(ListStats[[approaches[i]]][["Sigma_B_kappa"]][[cond]]))
       tmpInf <- is.infinite(tmpList)
-      if (any(tmpInf)){
+      if (any(tmpInf)) {
         tmpList[tmpInf] <- NA
       }
-      TableStats[cond, paste("kappa_B", approaches[i], sep="_")] <- round(mean(tmpList, na.rm=TRUE), 3)
-      tmpInf <- factor(tmpInf, levels=c("TRUE", "FALSE"))
+      TableStats[cond, paste("kappa_B", approaches[i], sep = "_")] <-
+        round(mean(tmpList, na.rm = TRUE), 3)
+      tmpInf <- factor(tmpInf, levels = c("TRUE", "FALSE"))
       tmp <- table(tmpInf)
-      TableStats[cond, paste("Infkappa_B", approaches[i], sep="_")] <- tmp[1] / ( tmp[1] + tmp[2]) * 100
+      TableStats[cond, paste("Infkappa_B", approaches[i], sep = "_")] <-
+        tmp[1] / (tmp[1] + tmp[2]) * 100
       
-    }
 
     # model properties
     
@@ -509,6 +626,21 @@ for (cond in 1:ncond){
       TableStats[cond, paste("relBias_B", approaches[i], sep="_")] <- round( mean( c(((Bias_var_B / popVar_B)* 100), ((Bias_cov_B / popCov_B)* 100)) ), 2)
       TableStats[cond, paste("relVar_B", approaches[i], sep="_")] <- round( mean( c(((Var_var_B / popVar_B)* 100), ((MSE_cov_B / popCov_B)* 100)) ), 2)
        
+      # ICC_Sigma_theta (based on model parameters of unstructured model)
+      ICC_Sigma_theta <- unlist((var_B/(var_W+var_B)))
+      tmp <- sum(ICC_Sigma_theta < 0)
+      if (tmp > 0){
+        TableStats[cond, paste("ICC_Sigma_theta_neg", approaches[i], sep="_")] <- round(tmp/length(ICC_Sigma_theta) * 100, 2)
+        ICC_Sigma_theta[ICC_Sigma_theta < 0] <- 0
+      }
+      TableStats[cond, paste("ICC_Sigma_theta", approaches[i], sep="_")] <- round(mean(ICC_Sigma_theta, na.rm=TRUE), 2)
+      
+      # coverage
+      coverage_W <- unname(unlist(ListStats[[approaches[i]]][["coverage_W"]][[cond]]))
+      TableStats[cond, paste("coverage_W", approaches[i], sep="_")] <- round(sum(coverage_W)/length(coverage_W) * 100, 2)
+      coverage_B <- unname(unlist(ListStats[[approaches[i]]][["coverage_B"]][[cond]]))
+      TableStats[cond, paste("coverage_B", approaches[i], sep="_")] <- round(sum(coverage_B)/length(coverage_B) * 100, 2)
+      
     }  
   }
 }
@@ -529,6 +661,11 @@ for (i in 1:napproach){
   TableStats[paste("relVar", approaches[i], sep="_")] <- round(rowMeans(select(TableStats, paste(c("relVar_W", "relVar_B"), approaches[i], sep="_"))), 2)
 }
 
+TableStats <- dplyr::mutate(TableStats, S_LF= ((p)*(p+1)/2 + (p)), .keep="all") # unique elements of S_LF
+TableStats <- dplyr::mutate(TableStats, S_WF= ((p*n)*(p*n+1)/2 + (p*n)), .keep="all") # unique elements of S_WF
+TableStats <- dplyr::mutate(TableStats, ratio_LF= (p)/g, .keep="all") # cols:rows LF-B
+TableStats <- dplyr::mutate(TableStats, ratio_WF= (p*n)/g, .keep="all") # cols:rows WF-T
+
 write.xlsx( TableStats, file = paste0(pathO, "TableStats.xlsx"))
 
 
@@ -545,11 +682,23 @@ for (i in 1:napproach){
   }
 }
 
+ratio <- c()
+for (i in 1:length(approaches)){
+  if (grepl("LF", approaches[i])){
+    ratio <- append(ratio, TableStats$ratio_LF)
+  } else if (grepl("WF", approaches[i])){
+    ratio <- append(ratio, TableStats$ratio_WF)
+  }
+}
+
 dat <- data.frame(cond = rep(1:ncond, napproach),
                   n = rep(TableStats$n, napproach),
                   g = rep(TableStats$g, napproach),
                   p = rep(TableStats$p, napproach),
+                  ratio  = ratio,
                   ICC = rep(TableStats$ICC, napproach),
+                  # cor_W = rep(TableStats$cor_W, napproach),
+                  # cor_B = rep(TableStats$cor_B, napproach),
                   approach = factor(rep(approaches, each=ncond), level=approaches, ordered=TRUE),
                   df = df,
                   # matrix properties
@@ -640,58 +789,15 @@ dat <- data.frame(cond = rep(1:ncond, napproach),
                   relMSE = unlist(TableStats[, paste0("relMSE_", approaches)], use.names=FALSE),
                   relRMSE = unlist(TableStats[, paste0("relRMSE_", approaches)], use.names=FALSE),
                   relBias = unlist(TableStats[, paste0("relBias_", approaches)], use.names=FALSE),
-                  relVar = unlist(TableStats[, paste0("relVar_", approaches)], use.names=FALSE)
+                  relVar = unlist(TableStats[, paste0("relVar_", approaches)], use.names=FALSE),
+                  # coverage
+                  coverage_W = unlist(TableStats[, paste0("coverage_W_", approaches)], use.names=FALSE),
+                  coverage_B = unlist(TableStats[, paste0("coverage_B_", approaches)], use.names=FALSE),
+                  # ICC
+                  ICC_S = unlist(TableStats[, paste0("ICC_S_", approaches)], use.names=FALSE),
+                  ICC_Sigma = unlist(TableStats[, paste0("ICC_Sigma_", approaches)], use.names=FALSE),
+                  ICC_Sigma_theta = unlist(TableStats[, paste0("ICC_Sigma_theta_", approaches)], use.names=FALSE)
 )
-
-# cols:rows (vars:obs)
-vo_LF_W <- c() # rows:cols ratio (3 groups)
-vo_LF_B <- c()
-vo_ratio_LF_B <- c()
-vo_WF <- c()
-vo_ratio_WF <- c()
-for (i in 1:nrow(TableConds)){ 
-  
-  if ((TableConds$n[i]*TableConds$g[i]) < TableConds$p[i]){
-    vo_LF_W <- append(vo_LF_W, ">") # r<c
-  } else if ((TableConds$n[i]*TableConds$g[i]) == TableConds$p[i]){
-    vo_LF_W <- append(vo_LF_W, "=") # r=c
-  } else if ((TableConds$n[i]*TableConds$g[i]) > TableConds$p[i]){
-    vo_LF_W <- append(vo_LF_W, "<") # r>c
-  }
-  
-  vo_ratio_LF_B <- append(vo_ratio_LF_B, (TableConds$p[i]/TableConds$g[i]))
-  if (TableConds$g[i] < TableConds$p[i]){
-    vo_LF_B <- append(vo_LF_B, ">") # r<c
-  } else if (TableConds$g[i] == TableConds$p[i]){
-    vo_LF_B <- append(vo_LF_B, "=") # r=c
-  } else if (TableConds$g[i] > TableConds$p[i]){
-    vo_LF_B <- append(vo_LF_B, "<") # r>c
-  }
-  
-  vo_ratio_WF <- append(vo_ratio_WF, ((TableConds$p[i]*TableConds$n[i])/TableConds$g[i]))
-  if (TableConds$g[i] < (TableConds$p[i]*TableConds$n[i])){
-    vo_WF <- append(vo_WF, ">") # r<c
-  } else if (TableConds$g[i] == (TableConds$p[i]*TableConds$n[i])){
-    vo_WF <- append(vo_WF, "=") # r=c
-  } else if (TableConds$g[i] > (TableConds$p[i]*TableConds$n[i])){
-    vo_WF <- append(vo_WF, "<") # r>c
-  }
-  
-}
-dat$LF_W <- rep(vo_LF_W, napproach)
-dat$LF_B <- rep(vo_LF_B, napproach)
-dat$WF_T <- rep(vo_WF, napproach)
-
-vo_ratio <- c()
-for (i in 1:napproach){
-  if (grepl("LF", approaches[i])){
-    vo_ratio <- append(vo_ratio, vo_ratio_LF_B)
-  } else if (grepl("WF", approaches[i])){
-    vo_ratio <- append(vo_ratio, vo_ratio_WF)
-  }
-}
-dat$ratio <- vo_ratio
 
 
 saveRDS(dat, paste0(pathO, "dat.rds"))
-
