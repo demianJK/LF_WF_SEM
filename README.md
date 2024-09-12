@@ -1,5 +1,6 @@
 # LF_WF_SEM
 R code and data for simulation study, tables and figures.
+https://www.tandfonline.com/doi/full/10.1080/10705511.2024.2320050?src=recsys
 
 
 If you want to run the simulation, check out run.R and summarize.R
